@@ -10,10 +10,16 @@ import csv
 from operator import itemgetter
 import queue
 
+# --- Pre-compiled Regular Expressions for Performance and Maintainability ---
+# Regex for a 20-digit receipt number
+RECEIPT_NO_REGEX_20 = re.compile(r'(\d{20})')
+# Regex for finding a 20-digit number after the label
+RECEIPT_NO_LABEL_REGEX_20 = re.compile(r'回单编号[：:\s]*(\d{20})')
+
 class ReceiptSplitterApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("农行电子回单智能拆分工具 V1.8.2 (修复版)")
+        self.root.title("农行电子回单智能拆分工具 V1.0.0")
         self.root.geometry("1200x700")
 
         self.source_file = ""
@@ -148,6 +154,14 @@ class ReceiptSplitterApp:
         self.progress_bar.grid(row=0, column=1, sticky="e")
         
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        # 在 __init__ 底部修改
+        def handle_root_click(event):
+            # 如果点击的不是输入框本身，才转移焦点
+            if event.widget != self.entry_local_company:
+                self.root.focus_set()
+
+        self.root.bind("<Button-1>", handle_root_click)
 
     def check_queue(self):
         """检查队列中的GUI更新请求（线程安全）"""
@@ -293,24 +307,25 @@ class ReceiptSplitterApp:
         self.log(f"序号 {seq} 的记录已更新。")
 
     def clear_placeholder(self, event):
-        """当输入框获得焦点时，如果内容是placeholder，则清空"""
+        """当获得焦点时：如果是占位符，则清空"""
         current_text = self.entry_local_company.get()
         if current_text == self.placeholder_text:
             self.entry_local_company.delete(0, "end")
             self.entry_local_company.config(foreground="black")
 
     def restore_placeholder(self, event):
-        """当输入框失去焦点时，如果内容为空，则恢复placeholder"""
+        """当失去焦点时：如果为空，则恢复占位符"""
+        # 调试打印
+        print(f"DEBUG: FocusOut Triggered. Current content: '{self.entry_local_company.get()}'")
+
         current_text = self.entry_local_company.get().strip()
         if not current_text:
-            # 确保先清空，避免重复插入
             self.entry_local_company.delete(0, "end")
             self.entry_local_company.insert(0, self.placeholder_text)
             self.entry_local_company.config(foreground="gray")
         else:
-            # 如果有内容但不是placeholder，确保文字颜色是黑色
-            if current_text != self.placeholder_text:
-                self.entry_local_company.config(foreground="black")
+            # 如果有实际内容，确保颜色是黑色的
+            self.entry_local_company.config(foreground="black")
 
     def log(self, message):
         self.lbl_status.config(text=f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
@@ -334,10 +349,45 @@ class ReceiptSplitterApp:
     def clean_filename(self, text):
         return re.sub(r'[\\/*?:"<>|]', "", text).strip()
 
+    def is_valid_abc_receipt(self, doc, check_limit=3):
+        """
+        极速检测是否为农行回单
+        :param doc: fitz.Document 对象
+        :param check_limit: 最多检查前几页
+        :return: (bool, message)
+        """
+        # 1. 基础指纹关键词
+        fingerprints = ["中国农业银行", "电子回单", "回单编号"]
+
+        # 2. 如果文档总页数比限制少，则按实际页数检查
+        actual_limit = min(len(doc), check_limit)
+
+        found_any_feature = False
+        for i in range(actual_limit):
+            page_text = doc[i].get_text()
+            # 统计匹配到的关键词数量
+            match_count = sum(1 for word in fingerprints if word in page_text)
+
+            # 如果一页内匹配到2个以上关键词，基本可以判定是目标格式
+            if match_count >= 2:
+                found_any_feature = True
+                break
+
+        if not found_any_feature:
+            return False, f"在前 {actual_limit} 页中未检测到农行回单指纹标识。"
+
+        return True, "验证通过"
+
     def analyze_pdf(self):
-        """V1.8.2 核心解析逻辑：精确坐标定位 + 严格排序"""
+        """核心解析逻辑：高精度定位 + 严格20位编号匹配"""
         # 使用线程安全的方式清空树视图
         self.safe_gui_update(self._clear_tree)
+
+        # --- 新增：指纹校验逻辑 ---
+        is_valid, msg = self.is_valid_abc_receipt(self.doc)
+        if not is_valid:
+            self.safe_gui_update(self._show_analysis_error, msg)
+            return
         
         local_company_name = self.entry_local_company.get().strip()
         if local_company_name == self.placeholder_text:
@@ -353,8 +403,37 @@ class ReceiptSplitterApp:
                 receipt_rects = [fitz.Rect(0, boundaries[i] + 2, width, boundaries[i+1] - 2) 
                                 for i in range(len(boundaries) - 1) 
                                 if boundaries[i+1] - boundaries[i] > 150]
+                
+                # 如果没有识别到分隔线，尝试基于"回单编号"标签位置来分割
+                if not receipt_rects or len(receipt_rects) == 1:
+                    all_words = page.get_text("words")
+                    receipt_no_labels = []
+                    for w in all_words:
+                        if "回单编号" in w[4]:
+                            w_rect = fitz.Rect(w[:4])
+                            receipt_no_labels.append(w_rect.y0)
+                    
+                    if len(receipt_no_labels) > 1:
+                        # 基于"回单编号"标签位置重新分割
+                        receipt_no_labels = sorted(set(receipt_no_labels))
+                        # 为每个回单编号标签创建区域（从标签上方50像素到下一个标签上方50像素）
+                        new_boundaries = [0]
+                        for label_y in receipt_no_labels:
+                            new_boundaries.append(label_y - 50)  # 标签上方50像素
+                        new_boundaries.append(height)
+                        new_boundaries = sorted(set(new_boundaries))
+                        
+                        # 创建新的回单区域
+                        receipt_rects = []
+                        for i in range(len(new_boundaries) - 1):
+                            if new_boundaries[i+1] - new_boundaries[i] > 150:
+                                receipt_rects.append(fitz.Rect(0, new_boundaries[i], width, new_boundaries[i+1]))
+                
                 if not receipt_rects and height > 150:
                     receipt_rects.append(page.rect)
+                
+                # 确保回单区域按y坐标排序
+                receipt_rects.sort(key=lambda r: r.y0)
 
                 for crop_rect in receipt_rects:
                     words = page.get_text("words", clip=crop_rect)
@@ -480,167 +559,110 @@ class ReceiptSplitterApp:
                     receiver_name = receiver_name_text.strip() or "未知收款方"
 
                     def extract_receipt_no_with_pdfplumber(page_idx, crop_rect):
-                        """使用pdfplumber提取回单编号（优先方法），限制在当前回单区域内"""
+                        """使用pdfplumber提取回单编号，严格匹配20位数字"""
                         try:
                             with pdfplumber.open(self.source_file) as pdf:
                                 if page_idx >= len(pdf.pages):
                                     return None
                                 
                                 page = pdf.pages[page_idx]
+
+                                # 直接使用原始坐标，pdfplumber 也是默认左上角坐标系
+                                bbox = (crop_rect.x0, crop_rect.y0, crop_rect.x1, crop_rect.y1)
                                 
-                                # 将crop_rect转换为pdfplumber的bbox格式 (x0, top, x1, bottom)
-                                # fitz.Rect: (x0, y0, x1, y1)
-                                # pdfplumber bbox: (x0, top, x1, bottom) 注意y坐标是反的
-                                page_height = page.height
-                                bbox = (
-                                    crop_rect.x0,  # x0
-                                    page_height - crop_rect.y1,  # top (pdfplumber的y坐标从下往上)
-                                    crop_rect.x1,  # x1
-                                    page_height - crop_rect.y0   # bottom
-                                )
-                                
-                                # 限制在当前回单区域内提取
                                 cropped_page = page.crop(bbox)
                                 
-                                # 方法1：提取表格（限制在当前回单区域）
+                                # 方法1：提取表格
                                 tables = cropped_page.extract_tables()
                                 if tables:
                                     for table in tables:
                                         for row in table:
-                                            # 将行转换为字符串，查找"回单编号"
                                             row_text = " ".join([str(cell) if cell else "" for cell in row])
                                             if "回单编号" in row_text:
-                                                # 在同一行中查找数字
                                                 for cell in row:
                                                     if cell:
-                                                        cell_text = str(cell)
-                                                        # 提取10-25位数字
-                                                        match = re.search(r'(\d{10,25})', cell_text)
+                                                        cell_text = str(cell).strip()
+                                                        match = RECEIPT_NO_REGEX_20.search(cell_text)
                                                         if match:
                                                             return match.group(1)
                                 
-                                # 方法2：如果表格提取失败，使用文本提取（限制在当前回单区域）
+                                # 方法2：如果表格提取失败，使用文本提取
                                 text = cropped_page.extract_text()
                                 if text:
-                                    # 查找"回单编号"后面的数字
-                                    match = re.search(r'回单编号[：:\s]*(\d{10,25})', text)
+                                    match = RECEIPT_NO_LABEL_REGEX_20.search(text)
                                     if match:
                                         return match.group(1)
                         except Exception:
-                            # pdfplumber提取失败，返回None，使用备用方法
                             pass
                         
                         return None
                     
-                    def extract_receipt_no_with_pymupdf(anchor_texts, search_width=500, stop_keywords=None):
-                        """使用PyMuPDF提取回单编号（备用方法）"""
+                    def extract_receipt_no_with_pymupdf(anchor_texts, search_width=250, stop_keywords=None):
+                        """使用PyMuPDF提取回单编号，严格匹配20位数字"""
                         if stop_keywords is None:
-                            stop_keywords = ["付款方", "收款方", "账号", "账户", "开户行"]
+                            stop_keywords = ["付款方", "收款方", "账号", "账户", "开户行", "金额", "日期"]
                         
-                        # 尝试多个anchor_text变体
-                        all_anchor_texts = anchor_texts + ["回单", "编号"]
-                        
-                        for anchor_text in all_anchor_texts:
+                        for anchor_text in anchor_texts:
                             anchor_words = [w for w in words if anchor_text in w[4]]
                             if not anchor_words:
                                 continue
 
-                            anchor_rect = fitz.Rect(anchor_words[0][:4])
+                            anchor_words.sort(key=lambda w: (w[1], w[0]))
+                            anchor_word = anchor_words[0]
+                            
+                            anchor_rect = fitz.Rect(anchor_word[:4])
                             anchor_y = anchor_rect.y0
                             
-                            # 查找同一行的冒号位置
+                            y_tolerance = 3
+                            
                             search_start_x = anchor_rect.x1
-                            colon_found = False
                             for w in words:
                                 w_rect = fitz.Rect(w[:4])
-                                w_text = w[4]
-                                # 查找同一行的冒号（放宽y坐标限制）
-                                if abs(w_rect.y0 - anchor_y) < 8 and ("：" in w_text or ":" in w_text):
+                                if abs(w_rect.y0 - anchor_y) < y_tolerance and (":" in w[4] or "：" in w[4]):
                                     if w_rect.x0 >= anchor_rect.x0:
                                         search_start_x = w_rect.x1
-                                        colon_found = True
                                         break
 
-                            # 如果没有找到冒号，从锚点文本结束位置开始
-                            if not colon_found:
-                                search_start_x = anchor_rect.x1
-
-                            # 放宽搜索范围：允许在同一行或下一行（y坐标误差放宽）
                             found_words = []
-                            y_tolerance = 10  # 放宽y坐标误差，支持PDF解析误差
-                            
                             for w in words:
                                 w_rect = fitz.Rect(w[:4])
                                 w_text = w[4].strip()
                                 
-                                # 放宽y坐标限制（允许PDF解析误差）
-                                y_diff = abs(w_rect.y0 - anchor_y)
-                                if y_diff > y_tolerance:
+                                if abs(w_rect.y0 - anchor_y) > y_tolerance:
                                     continue
                                 
-                                # 检查是否在搜索范围内（在冒号之后）
                                 if w_rect.x0 >= search_start_x and w_rect.x0 < search_start_x + search_width:
-                                    # 遇到停止关键词立即停止（但只在同一行严格检查）
-                                    should_stop = False
-                                    if y_diff < 8:  # 同一行时严格检查
-                                        for kw in stop_keywords:
-                                            if kw in w_text:
-                                                should_stop = True
-                                                break
-                                    
-                                    if should_stop:
+                                    if any(kw in w_text for kw in stop_keywords):
                                         break
                                     
-                                    # 收集包含数字的文本（放宽条件，因为PDF可能分割数字）
-                                    # 优先收集纯数字，但也收集包含数字的文本
-                                    if w_text:
-                                        if re.match(r'^\d+$', w_text):
-                                            # 纯数字，优先收集
-                                            found_words.append(w)
-                                        elif re.search(r'\d{5,}', w_text):
-                                            # 包含至少5位连续数字，可能是被分割的数字
-                                            found_words.append(w)
+                                    if w_text and re.match(r'^\d+$', w_text):
+                                        found_words.append(w)
                             
                             if found_words:
-                                # 按y坐标和x坐标排序（先按行，再按列）
-                                found_words.sort(key=lambda w: (w[1], w[0]))
-                                # 提取文本并连接
+                                found_words.sort(key=itemgetter(0))
                                 no_text = "".join(w[4] for w in found_words)
-                                
-                                # 移除所有非数字字符，只保留数字
                                 no_text_clean = re.sub(r'[^\d]', '', no_text)
                                 
-                                # 验证：回单编号应该是10-25位纯数字
-                                if len(no_text_clean) >= 10 and len(no_text_clean) <= 25:
+                                if len(no_text_clean) == 20:
                                     return no_text_clean
-                                
-                                # 如果有多个数字段，提取最长的（通常是回单编号）
-                                number_segments = re.findall(r'\d{10,25}', no_text_clean)
-                                if number_segments:
-                                    return max(number_segments, key=len)
-                        
-                        # 备用策略：如果找不到"回单编号"标签，在整个回单区域搜索长数字串
-                        # 查找所有10-25位的纯数字串，选择最靠上的（通常在首行）
-                        all_numbers = []
-                        for w in words:
-                            w_text = w[4].strip()
-                            if re.match(r'^\d{10,25}$', w_text):
-                                all_numbers.append((w[1], w[0], w_text))  # (y, x, text)
-                        
-                        if all_numbers:
-                            # 按y坐标排序，选择最靠上的（首行）
-                            all_numbers.sort(key=lambda x: (x[0], x[1]))
-                            # 返回最靠上的长数字串
-                            return all_numbers[0][2]
                         
                         return None
 
-                    # 优先使用pdfplumber提取回单编号（限制在当前回单区域内）
+                    # --- 提取流程 ---
+                    # 1. 优先使用pdfplumber
                     r_no_text = extract_receipt_no_with_pdfplumber(page_idx, crop_rect)
                     
-                    # 如果pdfplumber失败，使用PyMuPDF作为备用（words已经限制在crop_rect内）
+                    # 2. 如果失败，使用PyMuPDF
                     if not r_no_text:
-                        r_no_text = extract_receipt_no_with_pymupdf(["回单编号"], search_width=500)
+                        r_no_text = extract_receipt_no_with_pymupdf(["回单编号"], search_width=250)
+                    
+                    # 3. 最后手段：在区域文本中直接搜索
+                    if not r_no_text:
+                        crop_text = page.get_text(clip=crop_rect)
+                        if crop_text:
+                            match = RECEIPT_NO_LABEL_REGEX_20.search(crop_text)
+                            if match:
+                                r_no_text = match.group(1)
                     
                     r_no = r_no_text if r_no_text else "未知编号"
 
