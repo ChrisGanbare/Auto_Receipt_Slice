@@ -40,10 +40,12 @@ class ReceiptSplitterApp:
         self.root.title("农行电子回单智能拆分工具 V1.0.0")
         self.root.geometry("1200x700")
         # 设置窗口图标（如果有图标文件）
-        # try:
-        #     self.root.iconbitmap('icon.ico')
-        # except:
-        #     pass
+        try:
+            icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
+            if os.path.exists(icon_path):
+                self.root.iconbitmap(icon_path)
+        except Exception:
+            pass  # 如果图标文件不存在或加载失败，忽略错误
 
         self.source_file = ""
         self.doc = None
