@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 虚拟环境
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 打包相关
+build/
+dist/
+*.spec
+*.egg-info/
+
+# 可执行文件
+*.exe
+*.app
+*.dmg
+
+# 日志文件
+*.log
+*.csv
+log_*.csv
+
+# 临时文件
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+
+# 测试文件
+test_*.pdf
+示例*.pdf
+*.test.pdf
+
+# 备份文件
+*.bak
+*.backup
+backup.py
+
+# 文档（可选，如果不想提交某些文档）
+# *.md
+# 但保留 README.md
+
